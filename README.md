@@ -1,4 +1,4 @@
-Here is a complete, production-ready `README.md` tailored for your GitHub repository. It clearly explains how your multi-scene continuous generation pipeline operates, outlines the underlying architecture, documents input parameters, and references `workflow12.json` to make it easy for your clients to understand and utilize the endpoint.
+
 
 ---
 
