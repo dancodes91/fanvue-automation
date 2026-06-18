@@ -1,5 +1,3 @@
-
-
 import os
 import time
 import json
@@ -9,14 +7,14 @@ import tempfile
 import copy
 import requests
 import runpod
-
+ 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
 
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "https://yaiygjwbtzevjpxncvzu.supabase.co")
-SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhaXlnandidHpldmpweG5jdnp1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTQ2NTA0MiwiZXhwIjoyMDk3MDQxMDQyfQ.ui2Nt6AmAJv8v5XLf2ozumHlBG4BXg7ROIuo80V9UXk")       # paste service_role key in RunPod env vars
+SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhaXlnandidHpldmpweG5jdnp1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTQ2NTA0MiwiZXhwIjoyMDk3MDQxMDQyfQ.ui2Nt6AmAJv8v5XLf2ozumHlBG4BXg7ROIuo80V9UXk")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "videos")
 
 DEFAULT_WORKFLOW_PATH = "/workflow.json"
@@ -35,6 +33,7 @@ OUTPUT_NODE_TYPES = {
 MAX_FRAMES_PER_SCENE     = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS              = 16
+SCENES_PER_BATCH         = 3
 
 _comfy_ready = False
 
@@ -61,7 +60,7 @@ def supabase_upload(local_path: str, remote_filename: str) -> str:
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Supabase upload failed {resp.status_code}: {resp.text}")
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{remote_filename}"
-    print(f"[supabase] Uploaded -> {public_url}")
+    print(f"[supabase] -> {public_url}")
     return public_url
 
 
@@ -124,6 +123,17 @@ def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
     return upload_resp.json().get("name", filename)
 
 
+def upload_image_bytes_to_comfy(image_bytes: bytes, filename: str) -> str:
+    resp = requests.post(
+        f"{COMFY_BASE}/upload/image",
+        files={"image": (filename, image_bytes, "image/png")},
+        data={"overwrite": "true"},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json().get("name", filename)
+
+
 def upload_images_to_comfy(images):
     uploaded = []
     for img in images:
@@ -176,7 +186,7 @@ def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
             if prompt_id in data:
                 return data[prompt_id]
         except requests.exceptions.ConnectionError:
-            print("[wait_for_history] Connection dropped, retrying in 5s...")
+            print("[wait_for_history] Connection dropped, retrying...")
             time.sleep(5)
             continue
         time.sleep(poll_interval)
@@ -184,6 +194,10 @@ def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
 
 
 def get_output_filepaths(history):
+    """
+    Get output files from history. 
+    Returns files sorted by size descending — largest file = final stitched video.
+    """
     output_dir = find_output_dir()
     files = []
     for _, node_output in history.get("outputs", {}).items():
@@ -199,7 +213,16 @@ def get_output_filepaths(history):
                     os.path.join(output_dir, fname)
                 )
                 if os.path.isfile(fpath):
-                    files.append({"filename": fname, "filepath": fpath})
+                    size = os.path.getsize(fpath)
+                    files.append({
+                        "filename": fname,
+                        "filepath": fpath,
+                        "size": size
+                    })
+                    print(f"[output] Found: {fname} ({size/1024/1024:.1f} MB)")
+
+    # Sort by size descending — largest = final stitched video with all scenes
+    files.sort(key=lambda x: x["size"], reverse=True)
     return files
 
 
@@ -210,21 +233,32 @@ def workflow_has_output_node(workflow):
     )
 
 
+def extract_last_frame(video_path: str, output_path: str):
+    cmd = ["ffmpeg", "-y", "-sseof", "-3", "-i", video_path,
+           "-vframes", "1", "-q:v", "1", output_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg frame extract failed: {result.stderr}")
+    return output_path
+
+
 # ===========================================================================
 # WORKFLOW BUILDING
-# Each scene is a FULLY SELF-CONTAINED job — no cross-job node references.
-# Stitching is done by FFmpeg after all scenes complete.
+# Uses exact node IDs from wan22_SVI_Pro_8_JANapi.json:
+#   193:211 = Scene 1 positive prompt
+#   181:152 = Scene 2 positive prompt
+#   203:222 = Scene 3 positive prompt
+#   193:215, 181:160, 203:219 = WanImageToVideoSVIPro nodes (length control)
+#   193:217, 181:162, 203:218 = VAEDecode outputs
+#   181:168, 203:227 = ImageBatchExtendWithOverlap
+#   204 = VHS_VideoCombine
 # ===========================================================================
 
-def build_single_scene_workflow(base_workflow, positive_text, negative_text,
-                                 frames_per_scene, sampling_steps,
-                                 uploaded_filename, fps, scene_idx):
-    """
-    Build a completely self-contained single-scene workflow.
-    Uses only scene 1 nodes (193:xxx) — no overlap nodes, no cross-scene refs.
-    Output goes directly from VAEDecode → VHS_VideoCombine.
-    """
+def build_batch_workflow(base_workflow, scene_prompts, negative_text,
+                         frames_per_scene, sampling_steps,
+                         uploaded_filename, fps, batch_start_idx):
     wf = copy.deepcopy(base_workflow)
+    n  = len(scene_prompts)
 
     # Patch LoadImage
     if uploaded_filename:
@@ -232,29 +266,72 @@ def build_single_scene_workflow(base_workflow, positive_text, negative_text,
             if isinstance(node, dict) and node.get("class_type") == "LoadImage":
                 node["inputs"]["image"] = uploaded_filename
 
-    # Patch steps
+    # Patch BasicScheduler steps
     if sampling_steps:
         for nid, node in wf.items():
             if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
                 node["inputs"]["steps"] = int(sampling_steps)
 
-    # Patch scene 1 prompts and frames
-    wf["193:211"]["inputs"]["text"] = positive_text
+    # Vary seeds per batch
+    if "189" in wf:
+        wf["189"]["inputs"]["noise_seed"] = 43 + batch_start_idx
+    if "182" in wf:
+        wf["182"]["inputs"]["noise_seed"] = 44 + batch_start_idx
+    if "199" in wf:
+        wf["199"]["inputs"]["noise_seed"] = 45 + batch_start_idx
+
+    # Always patch Scene 1
+    wf["193:211"]["inputs"]["text"] = scene_prompts[0]
     wf["193:209"]["inputs"]["text"] = negative_text
     wf["193:215"]["inputs"]["length"] = frames_per_scene
-    # Use unique seed per scene
-    wf["189"]["inputs"]["noise_seed"] = 43 + scene_idx
+    wf["193:215"]["inputs"]["motion_latent_count"] = 0
 
-    # Wire VHS directly to scene 1 VAEDecode output (no overlap node needed)
-    wf["204"]["inputs"]["images"] = ["193:217", 0]
-    wf["204"]["inputs"]["frame_rate"] = fps
-    wf["204"]["inputs"]["filename_prefix"] = f"scene_{scene_idx:02d}"
+    if n == 1:
+        # Only Scene 1 — VHS takes from 193:217 (VAEDecode output)
+        wf["204"]["inputs"]["images"] = ["193:217", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
+        to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
+        for k in to_remove:
+            del wf[k]
 
-    # Remove all scene 2 and scene 3 nodes — not needed
-    to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
-    for k in to_remove:
-        del wf[k]
+    elif n == 2:
+        # Scene 1 + Scene 2
+        wf["181:152"]["inputs"]["text"] = scene_prompts[1]
+        wf["181:206"]["inputs"]["text"] = negative_text
+        wf["181:160"]["inputs"]["length"] = frames_per_scene
+        wf["181:160"]["inputs"]["motion_latent_count"] = 1
+        wf["181:160"]["inputs"]["prev_samples"]  = ["193:216", 0]
+        wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
+        wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
+        # VHS takes from 181:168 (overlap output) — contains scene1+scene2
+        wf["204"]["inputs"]["images"] = ["181:168", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
+        to_remove = [k for k in wf if k.startswith("203:")]
+        for k in to_remove:
+            del wf[k]
 
+    else:
+        # All 3 Scenes — exact workflow structure
+        wf["181:152"]["inputs"]["text"] = scene_prompts[1]
+        wf["181:206"]["inputs"]["text"] = negative_text
+        wf["181:160"]["inputs"]["length"] = frames_per_scene
+        wf["181:160"]["inputs"]["motion_latent_count"] = 1
+        wf["181:160"]["inputs"]["prev_samples"]  = ["193:216", 0]
+        wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
+        wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
+
+        wf["203:222"]["inputs"]["text"] = scene_prompts[2]
+        wf["203:220"]["inputs"]["text"] = negative_text
+        wf["203:219"]["inputs"]["length"] = frames_per_scene
+        wf["203:219"]["inputs"]["motion_latent_count"] = 1
+        wf["203:219"]["inputs"]["prev_samples"]  = ["181:208", 0]
+        wf["203:227"]["inputs"]["source_images"] = ["181:168", 0]
+        wf["203:227"]["inputs"]["new_images"]    = ["203:218", 0]
+        # VHS takes from 203:227 (final overlap) — contains all 3 scenes
+        wf["204"]["inputs"]["images"] = ["203:227", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
+
+    wf["204"]["inputs"]["filename_prefix"] = f"batch_{batch_start_idx:02d}"
     return wf
 
 
@@ -263,17 +340,14 @@ def build_single_scene_workflow(base_workflow, positive_text, negative_text,
 # ===========================================================================
 
 def ffmpeg_concat(video_paths: list, output_path: str):
-    """Concatenate video files using FFmpeg — no re-encoding, just stream copy."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         for vp in video_paths:
             f.write(f"file '{os.path.abspath(vp)}'\n")
         list_file = f.name
-
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
            "-i", list_file, "-c", "copy", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(list_file)
-
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg stitch failed: {result.stderr}")
     return output_path
@@ -307,7 +381,6 @@ def handler(job):
 
     uploaded_filename = resolve_input_image(payload)
 
-    # Prompts
     raw_prompts = payload.get("prompts")
     prompt_text = payload.get("prompt_text") or payload.get("prompt")
     if raw_prompts and isinstance(raw_prompts, list):
@@ -333,52 +406,80 @@ def handler(job):
     print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
           f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
 
-    # Run each scene as a fully independent self-contained ComfyUI job
-    for scene_idx in range(1, num_scenes + 1):
-        pos_text = prompts[min(scene_idx - 1, len(prompts) - 1)]
-        print(f"[handler] Scene {scene_idx}/{num_scenes}: {pos_text[:60]}")
+    scene_idx = 0
+    batch_num = 0
 
-        wf = build_single_scene_workflow(
+    while scene_idx < num_scenes:
+        batch_num  += 1
+        batch_size  = min(SCENES_PER_BATCH, num_scenes - scene_idx)
+        batch_prompts = [
+            prompts[min(scene_idx + i, len(prompts) - 1)]
+            for i in range(batch_size)
+        ]
+
+        print(f"[handler] Batch {batch_num}: scenes {scene_idx+1}-{scene_idx+batch_size} "
+              f"({batch_size} scene(s))")
+
+        wf = build_batch_workflow(
             base_workflow,
-            positive_text=pos_text,
+            scene_prompts=batch_prompts,
             negative_text=negative_text,
             frames_per_scene=frames_per_scene,
             sampling_steps=sampling_steps,
             uploaded_filename=uploaded_filename,
             fps=fps,
-            scene_idx=scene_idx,
+            batch_start_idx=scene_idx,
         )
 
-        result    = submit_prompt(wf, f"runpod_s{scene_idx}")
+        result    = submit_prompt(wf, f"runpod_b{batch_num}")
         prompt_id = result.get("prompt_id")
         if not prompt_id:
-            raise RuntimeError(f"Scene {scene_idx}: no prompt_id returned")
+            raise RuntimeError(f"Batch {batch_num}: no prompt_id")
 
         history = wait_for_history(prompt_id, timeout=14400)
         files   = get_output_filepaths(history)
 
         if not files:
-            raise RuntimeError(f"Scene {scene_idx}: no output files found")
+            raise RuntimeError(f"Batch {batch_num}: no output files found")
 
+        # Always use largest file — that's the fully stitched batch video
         chunk_path     = files[0]["filepath"]
-        chunk_filename = f"{job_id}_scene{scene_idx:02d}.mp4"
-        chunk_url      = supabase_upload(chunk_path, chunk_filename)
+        chunk_size_mb  = files[0]["size"] / 1024 / 1024
+        chunk_filename = f"{job_id}_batch{batch_num:02d}.mp4"
+        print(f"[handler] Using largest output: {chunk_path} ({chunk_size_mb:.1f} MB)")
+
+        chunk_url = supabase_upload(chunk_path, chunk_filename)
         chunk_urls.append(chunk_url)
         chunk_paths.append(chunk_path)
-        print(f"[handler] Scene {scene_idx} done -> {chunk_url}")
+        print(f"[handler] Batch {batch_num} uploaded -> {chunk_url}")
 
-    # FFmpeg stitch all chunks into one final video
+        # Extract last frame for next batch continuity
+        if scene_idx + batch_size < num_scenes:
+            last_frame_path = os.path.join(output_dir, f"last_frame_b{batch_num}.png")
+            try:
+                extract_last_frame(chunk_path, last_frame_path)
+                uploaded_filename = upload_image_bytes_to_comfy(
+                    open(last_frame_path, "rb").read(),
+                    f"last_frame_b{batch_num}.png"
+                )
+                print(f"[handler] Last frame -> {uploaded_filename} (next batch input)")
+            except Exception as e:
+                print(f"[handler] WARNING: last frame extract failed: {e}")
+
+        scene_idx += batch_size
+
+    # Stitch all batch chunks
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
     else:
-        print(f"[handler] Stitching {len(chunk_paths)} chunks with FFmpeg...")
+        print(f"[handler] Stitching {len(chunk_paths)} chunks...")
         final_filename = f"{job_id}_final.mp4"
         final_local    = os.path.join(output_dir, final_filename)
         ffmpeg_concat(chunk_paths, final_local)
 
     final_url = supabase_upload(final_local, final_filename)
-    print(f"[handler] Final video -> {final_url}")
+    print(f"[handler] Final -> {final_url}")
 
     return {
         "status":                    "success",
@@ -392,5 +493,3 @@ def handler(job):
 
 
 runpod.serverless.start({"handler": handler})
-  
-  
